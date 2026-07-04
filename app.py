@@ -29,6 +29,55 @@ KNOWN_BRANDS = [
     "bankofamerica", "wellsfargo", "chase", "ebay", "instagram", "dropbox",
 ]
 
+
+def is_valid_url(url: str) -> bool:
+    """
+    Returns True only if the input looks like a real URL.
+    Checks:
+      - No spaces
+      - Has a hostname with at least one dot
+      - TLD is 2-6 alphabetic characters (or it's a valid IP address)
+      - Domain body is at least 1 character
+    """
+    url = url.strip()
+
+    # Must not contain spaces
+    if " " in url:
+        return False
+
+    # Add scheme if missing so urlparse works properly
+    test_url = url if "://" in url else "http://" + url
+
+    try:
+        parsed = urlparse(test_url)
+        hostname = parsed.netloc or ""
+
+        # Remove port if present
+        hostname = hostname.split(":")[0]
+
+        # Hostname must exist and contain at least one dot
+        if not hostname or "." not in hostname:
+            return False
+
+        # TLD (part after last dot) must be 2-6 alphabetic characters
+        tld = hostname.rsplit(".", 1)[-1]
+        if not re.match(r"^[a-zA-Z]{2,6}$", tld):
+            # Allow IP addresses
+            ip_pattern = r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
+            if not re.match(ip_pattern, hostname):
+                return False
+
+        # Domain body before TLD must be at least 1 character
+        domain_body = hostname.rsplit(".", 1)[0]
+        if len(domain_body) < 1:
+            return False
+
+        return True
+
+    except Exception:
+        return False
+
+
 def extract_lexical_features(url: str) -> dict:
     parsed = urlparse(url if "://" in url else "http://" + url)
     hostname = parsed.netloc or ""
@@ -71,12 +120,16 @@ def extract_lexical_features(url: str) -> dict:
     }
     return features
 
+
 def predict_url(url: str) -> dict:
     feats = extract_lexical_features(url)
     row = pd.DataFrame([[feats[col] for col in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
     proba_phishing = float(model.predict_proba(row)[0, 1])
     label = "Phishing" if proba_phishing >= 0.5 else "Legitimate"
     return {"prediction": label, "phishing_probability": proba_phishing, "features": feats}
+
+
+# ── UI ──────────────────────────────────────────────────────────────────────
 
 st.title("🛡️ AI-Based Phishing URL Detector")
 st.markdown(
@@ -85,29 +138,54 @@ st.markdown(
     "visited or downloaded."
 )
 
-url_input = st.text_input("URL to check", placeholder="e.g. https://www.example.com/login")
+url_input = st.text_input(
+    "URL to check",
+    placeholder="e.g. https://www.example.com/login"
+)
 check_clicked = st.button("Check URL", type="primary")
 
-if check_clicked and url_input.strip():
-    with st.spinner("Analysing URL..."):
-        result = predict_url(url_input.strip())
-    proba = result["phishing_probability"]
-    label = result["prediction"]
-    st.divider()
-    if label == "Phishing":
-        st.error(f"⚠️ **{label}** — estimated phishing probability: {proba:.1%}")
+if check_clicked:
+    url = url_input.strip()
+
+    if not url:
+        st.warning("⚠️ Please enter a URL first.")
+
+    elif not is_valid_url(url):
+        st.error(
+            "❌ **Invalid URL** — please enter a real website address.\n\n"
+            "**Valid examples:**\n"
+            "- `https://www.google.com`\n"
+            "- `http://paypal-secure-login.verify-account.tk/signin`\n"
+            "- `192.168.1.1/login`\n\n"
+            "Random text like `jhghjhgjh` is not a URL and cannot be analysed."
+        )
+
     else:
-        st.success(f"✅ **{label}** — estimated phishing probability: {proba:.1%}")
-    st.progress(proba)
-    with st.expander("See extracted URL features"):
-        feat_df = pd.DataFrame(result["features"].items(), columns=["Feature", "Value"])
-        st.dataframe(feat_df, use_container_width=True, hide_index=True)
-    st.caption(
-        "Note: this lightweight model only looks at the URL's text structure — "
-        "it does not fetch or render the actual webpage."
-    )
-elif check_clicked:
-    st.warning("Please enter a URL first.")
+        with st.spinner("Analysing URL..."):
+            result = predict_url(url)
+
+        proba = result["phishing_probability"]
+        label = result["prediction"]
+
+        st.divider()
+
+        if label == "Phishing":
+            st.error(f"⚠️ **{label}** — estimated phishing probability: {proba:.1%}")
+        else:
+            st.success(f"✅ **{label}** — estimated phishing probability: {proba:.1%}")
+
+        st.progress(proba)
+
+        with st.expander("See extracted URL features"):
+            feat_df = pd.DataFrame(
+                result["features"].items(), columns=["Feature", "Value"]
+            )
+            st.dataframe(feat_df, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "Note: this lightweight model only looks at the URL's text structure — "
+            "it does not fetch or render the actual webpage."
+        )
 
 st.divider()
 with st.expander("ℹ️ About this project"):
