@@ -1,5 +1,7 @@
 import re
+import requests
 from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 
 import joblib
 import pandas as pd
@@ -31,49 +33,24 @@ KNOWN_BRANDS = [
 
 
 def is_valid_url(url: str) -> bool:
-    """
-    Returns True only if the input looks like a real URL.
-    Checks:
-      - No spaces
-      - Has a hostname with at least one dot
-      - TLD is 2-6 alphabetic characters (or it's a valid IP address)
-      - Domain body is at least 1 character
-    """
     url = url.strip()
-
-    # Must not contain spaces
     if " " in url:
         return False
-
-    # Add scheme if missing so urlparse works properly
     test_url = url if "://" in url else "http://" + url
-
     try:
         parsed = urlparse(test_url)
         hostname = parsed.netloc or ""
-
-        # Remove port if present
         hostname = hostname.split(":")[0]
-
-        # Hostname must exist and contain at least one dot
         if not hostname or "." not in hostname:
             return False
-
-        # TLD (part after last dot) must be 2-6 alphabetic characters
         tld = hostname.rsplit(".", 1)[-1]
         if not re.match(r"^[a-zA-Z]{2,6}$", tld):
-            # Allow IP addresses
-            ip_pattern = r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
-            if not re.match(ip_pattern, hostname):
+            if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", hostname):
                 return False
-
-        # Domain body before TLD must be at least 1 character
         domain_body = hostname.rsplit(".", 1)[0]
         if len(domain_body) < 1:
             return False
-
         return True
-
     except Exception:
         return False
 
@@ -87,7 +64,7 @@ def extract_lexical_features(url: str) -> dict:
     hostname_parts = hostname.split(".")
     subdomain_level = max(len(hostname_parts) - 2, 0)
     path_level = len([p for p in path.split("/") if p])
-    features = {
+    return {
         "NumDots": full_url.count("."),
         "SubdomainLevel": subdomain_level,
         "PathLevel": path_level,
@@ -118,30 +95,124 @@ def extract_lexical_features(url: str) -> dict:
         "NumSensitiveWords": sum(word in full_url.lower() for word in SENSITIVE_WORDS),
         "EmbeddedBrandName": int(any(b in (path + query).lower() for b in KNOWN_BRANDS)),
     }
-    return features
 
 
-def predict_url(url: str) -> dict:
+def fetch_html_features(url: str) -> dict:
+    """Fetch the actual page and extract extra HTML-based features."""
+    full_url = url if "://" in url else "http://" + url
+    try:
+        resp = requests.get(full_url, timeout=8, allow_redirects=True,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        all_links = soup.find_all("a", href=True)
+        parsed_base = urlparse(full_url)
+        base_domain = parsed_base.netloc
+
+        external_links = [
+            a for a in all_links
+            if urlparse(a["href"]).netloc and urlparse(a["href"]).netloc != base_domain
+        ]
+        pct_external = len(external_links) / max(len(all_links), 1)
+
+        forms = soup.find_all("form")
+        has_login_form = any(
+            inp.get("type", "").lower() in ["password", "email"]
+            for form in forms for inp in form.find_all("input")
+        )
+
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
+        suspicious_title = any(w in title.lower() for w in SENSITIVE_WORDS)
+
+        iframes = len(soup.find_all("iframe"))
+        missing_title = int(len(title) == 0)
+
+        return {
+            "fetched": True,
+            "pct_external_links": round(pct_external, 3),
+            "has_login_form": int(has_login_form),
+            "suspicious_title": int(suspicious_title),
+            "num_iframes": iframes,
+            "missing_title": missing_title,
+            "page_title": title or "(no title)",
+            "status_code": resp.status_code,
+            "redirected": resp.url != full_url,
+            "final_url": resp.url,
+        }
+    except requests.exceptions.Timeout:
+        return {"fetched": False, "error": "Page took too long to respond (timeout)."}
+    except requests.exceptions.ConnectionError:
+        return {"fetched": False, "error": "Could not connect to the page."}
+    except Exception as e:
+        return {"fetched": False, "error": str(e)}
+
+
+def compute_deep_score(url_proba: float, html: dict) -> float:
+    """
+    Combine URL-model probability with HTML signals into a final score.
+    Weights: URL model 60%, HTML signals 40%.
+    """
+    if not html.get("fetched"):
+        return url_proba
+
+    html_score = 0.0
+    html_score += html["pct_external_links"] * 0.30
+    html_score += html["has_login_form"] * 0.25
+    html_score += html["suspicious_title"] * 0.20
+    html_score += min(html["num_iframes"] / 5, 1.0) * 0.15
+    html_score += html["missing_title"] * 0.10
+
+    combined = 0.60 * url_proba + 0.40 * html_score
+    return round(min(combined, 1.0), 4)
+
+
+def predict_url(url: str, deep: bool = False) -> dict:
     feats = extract_lexical_features(url)
     row = pd.DataFrame([[feats[col] for col in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
-    proba_phishing = float(model.predict_proba(row)[0, 1])
-    label = "Phishing" if proba_phishing >= 0.5 else "Legitimate"
-    return {"prediction": label, "phishing_probability": proba_phishing, "features": feats}
+    url_proba = float(model.predict_proba(row)[0, 1])
+
+    html_info = {}
+    final_proba = url_proba
+
+    if deep:
+        html_info = fetch_html_features(url)
+        final_proba = compute_deep_score(url_proba, html_info)
+
+    label = "Phishing" if final_proba >= 0.5 else "Legitimate"
+    return {
+        "prediction": label,
+        "phishing_probability": final_proba,
+        "url_only_probability": url_proba,
+        "features": feats,
+        "html_info": html_info,
+    }
 
 
-# ── UI ──────────────────────────────────────────────────────────────────────
+# ── UI ───────────────────────────────────────────────────────────────────────
 
 st.title("🛡️ AI-Based Phishing URL Detector")
 st.markdown(
     "Paste a URL below and the model will estimate whether it's **phishing** or "
-    "**legitimate**, based only on the structure of the URL itself — no page is "
-    "visited or downloaded."
+    "**legitimate**."
 )
 
-url_input = st.text_input(
-    "URL to check",
-    placeholder="e.g. https://www.example.com/login"
+url_input = st.text_input("URL to check", placeholder="e.g. https://www.example.com/login")
+
+st.markdown("**Analysis Mode**")
+mode = st.radio(
+    "mode",
+    ["🔵 Quick — URL structure only (instant)", "🟢 Deep — Fetch page HTML (~5-10 sec, more accurate)"],
+    label_visibility="collapsed",
 )
+deep_mode = mode.startswith("🟢")
+
+if deep_mode:
+    st.info(
+        "⚠️ **Deep mode will actually visit the URL** to fetch its HTML. "
+        "Only use this on URLs you are reasonably confident are safe to visit, "
+        "or that you own. Do not use on highly suspicious links."
+    )
+
 check_clicked = st.button("Check URL", type="primary")
 
 if check_clicked:
@@ -155,14 +226,13 @@ if check_clicked:
             "❌ **Invalid URL** — please enter a real website address.\n\n"
             "**Valid examples:**\n"
             "- `https://www.google.com`\n"
-            "- `http://paypal-secure-login.verify-account.tk/signin`\n"
-            "- `192.168.1.1/login`\n\n"
+            "- `http://paypal-secure-login.verify-account.tk/signin`\n\n"
             "Random text like `jhghjhgjh` is not a URL and cannot be analysed."
         )
 
     else:
-        with st.spinner("Analysing URL..."):
-            result = predict_url(url)
+        with st.spinner("Analysing URL..." if not deep_mode else "Fetching page and analysing... this may take a few seconds."):
+            result = predict_url(url, deep=deep_mode)
 
         proba = result["phishing_probability"]
         label = result["prediction"]
@@ -176,16 +246,32 @@ if check_clicked:
 
         st.progress(proba)
 
+        if deep_mode:
+            html = result.get("html_info", {})
+            if html.get("fetched"):
+                col1, col2, col3 = st.columns(3)
+                col1.metric("URL-only score", f"{result['url_only_probability']:.1%}")
+                col2.metric("External links", f"{html['pct_external_links']:.1%}")
+                col3.metric("Login form found", "Yes" if html["has_login_form"] else "No")
+
+                with st.expander("🌐 Page details"):
+                    st.write(f"**Page title:** {html['page_title']}")
+                    st.write(f"**Status code:** {html['status_code']}")
+                    st.write(f"**Redirected:** {'Yes → ' + html['final_url'] if html['redirected'] else 'No'}")
+                    st.write(f"**Iframes found:** {html['num_iframes']}")
+                    st.write(f"**Suspicious title keywords:** {'Yes' if html['suspicious_title'] else 'No'}")
+            else:
+                st.warning(f"⚠️ Could not fetch page: {html.get('error', 'Unknown error')}. Showing URL-only result.")
+
         with st.expander("See extracted URL features"):
-            feat_df = pd.DataFrame(
-                result["features"].items(), columns=["Feature", "Value"]
-            )
+            feat_df = pd.DataFrame(result["features"].items(), columns=["Feature", "Value"])
             st.dataframe(feat_df, use_container_width=True, hide_index=True)
 
-        st.caption(
-            "Note: this lightweight model only looks at the URL's text structure — "
-            "it does not fetch or render the actual webpage."
-        )
+        if not deep_mode:
+            st.caption(
+                "Note: Quick mode only looks at URL structure — no page is visited. "
+                "Switch to Deep mode for a more thorough analysis."
+            )
 
 st.divider()
 with st.expander("ℹ️ About this project"):
@@ -195,6 +281,7 @@ with st.expander("ℹ️ About this project"):
 
         - **Full model** used 10,000 webpages and 48 features, comparing Logistic Regression,
           Random Forest, SVM, and XGBoost.
-        - **This demo** uses a lightweight XGBoost model trained on 26 URL-only features
-          for instant, safe screening without visiting the site.
+        - **Quick mode** uses a lightweight XGBoost model on 26 URL-only features — instant, safe.
+        - **Deep mode** additionally fetches the page HTML to extract login forms, external links,
+          iframes, and title keywords for a more accurate combined score.
     """)
